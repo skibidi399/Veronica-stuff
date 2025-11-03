@@ -7,6 +7,10 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 
+
+
+
+
 local function getBehaviorFolder()
     return ReplicatedStorage:WaitForChild("Assets")
         :WaitForChild("Survivors")
@@ -17,13 +21,63 @@ end
 local behaviorFolder = getBehaviorFolder()
 local monitored = {} -- tracks highlights we've attached to
 
+local function safeIsDescendantOf(inst, ancestor)
+    if not inst or not ancestor then return false end
+    local ok, res = pcall(function() return inst:IsDescendantOf(ancestor) end)
+    return ok and res
+end
+
 local function adorneeIsPlayerCharacter(h)
-    if not h then return false end
-    local adornee = h.Adornee
+    if not h or not h.Parent then return false end
+
+    -- safely grab adornee
+    local adornee = nil
+    pcall(function() adornee = h.Adornee end)
+    if not adornee then return false end
+
+    -- ensure we have a current character reference (don't block long; just return false if none)
     local char = player.Character
-    if not adornee or not char then return false end
+    if not char then
+        -- if character not present yet, it's unlikely to be adornee now
+        -- but to reduce false-negative we can try to peek a little:
+        if player.CharacterAdded then
+            -- non-blocking quick check: if character added recently this will be handled by CharacterAdded connection elsewhere
+            return false
+        end
+        return false
+    end
+
+    -- direct equal
     if adornee == char then return true end
-    if adornee:IsDescendantOf(char) then return true end
+
+    -- if adornee is the model of the character (some cases) or a descendant of the character
+    if safeIsDescendantOf(adornee, char) then
+        return true
+    end
+
+    -- adornnee might be a Model that represents only a part of the character; check PrimaryPart / children
+    if adornee:IsA("Model") then
+        -- if the model contains any part that is descendant of char -> treat as match
+        local ok, found = pcall(function()
+            for _, part in ipairs(adornee:GetDescendants()) do
+                if part:IsA("BasePart") and part:IsDescendantOf(char) then
+                    return true
+                end
+            end
+            return false
+        end)
+        if ok and found then return true end
+    end
+
+    -- attachments: check the attachment's parent chain
+    if adornee:IsA("Attachment") then
+        local parentPart = adornee.Parent
+        if parentPart and safeIsDescendantOf(parentPart, char) then return true end
+    end
+
+    -- Humanoid-ish cases (if adornee is a Humanoid or similar object attached to character)
+    if adornee:IsA("Humanoid") and adornee.Parent == char then return true end
+
     return false
 end
 
@@ -277,52 +331,122 @@ local function monitorHighlight(h)
 
     local prevState = adorneeIsPlayerCharacter(h)
     local connections = {}
+    local adorneeConn = nil
+    local pollLoop = nil
+    local alive = true
 
     local function cleanup()
+        alive = false
         for _, conn in ipairs(connections) do
             if conn and conn.Connected then
                 conn:Disconnect()
             end
         end
+        if adorneeConn and adorneeConn.Connected then
+            adorneeConn:Disconnect()
+            adorneeConn = nil
+        end
+        if pollLoop then
+            pollLoop:Cancel()
+            pollLoop = nil
+        end
         monitored[h] = nil
     end
 
-    local function onChanged()
-        -- if highlight no longer exists, we'll handle that in AncestryChanged below
-        if not h or not h.Parent then return end
+    local function attachToCurrentAdornee()
+        -- disconnect old adornee listener
+        if adorneeConn and adorneeConn.Connected then
+            adorneeConn:Disconnect()
+            adorneeConn = nil
+        end
 
+        local currentAdornee = nil
+        pcall(function() currentAdornee = h.Adornee end)
+        if currentAdornee and currentAdornee:IsA("Instance") then
+            -- listen to its AncestryChanged so we detect being parented under player char
+            local ok, conn = pcall(function()
+                return currentAdornee.AncestryChanged:Connect(function()
+                    if alive then
+                        task.spawn(function() -- small debounce
+                            onChanged()
+                        end)
+                    end
+                end)
+            end)
+            if ok and conn then adorneeConn = conn end
+        end
+    end
+
+    function onChanged()
+        if not h or not h.Parent then return end
         local currState = adorneeIsPlayerCharacter(h)
         if prevState ~= currState then
             if currState then
                 print("Highlight's Adornee is PLAYER ->", h:GetFullName())
-                keypress(Enum.KeyCode.Space)
-                wait(0.09)
-                keyrelease(Enum.KeyCode.Space)
+                -- your existing actions
+                pcall(function()
+                    keypress(Enum.KeyCode.Space)
+                    wait(0.09)
+                    keyrelease(Enum.KeyCode.Space)
+                end)
             else
                 print("Highlight's Adornee is NOT player ->", h:GetFullName())
             end
+            prevState = currState
         end
-        prevState = currState
     end
 
-    local c = safeConnectPropertyChanged(h, "Adornee", onChanged)
-    if c then table.insert(connections, c) end
+    -- Connect safe Adornee property changes
+    local propConn = safeConnectPropertyChanged(h, "Adornee", function()
+        attachToCurrentAdornee()
+        onChanged()
+    end)
+    if propConn then table.insert(connections, propConn) end
 
-    table.insert(connections, h.AncestryChanged:Connect(function(_, parent)
+    -- Respond when highlight is removed/destroyed
+    local ancestryConn = h.AncestryChanged:Connect(function(_, parent)
         if not parent then
             -- highlight destroyed/removed
-            
             showJoystickForSeconds(9)
-            
             cleanup()
         else
             onChanged()
         end
-    end))
+    end)
+    table.insert(connections, ancestryConn)
 
+    -- Listen for player character changes too
     table.insert(connections, player.CharacterAdded:Connect(onChanged))
     table.insert(connections, player.CharacterRemoving:Connect(onChanged))
 
+    -- Start a short polling fallback to catch transient states (lightweight)
+    -- We use task.spawn + a cancelable token-like table
+    local cancelled = false
+    pollLoop = {
+        Cancel = function() cancelled = true end
+    }
+    task.spawn(function()
+        local lastCheck = tick()
+        while not cancelled and h and h.Parent do
+            -- check every 0.15s but only do a real check every 0.15s to avoid too much cost
+            task.wait(0.15)
+            if cancelled then break end
+            -- quick check
+            local ok, curr = pcall(function() return adorneeIsPlayerCharacter(h) end)
+            if ok then
+                if curr ~= prevState then
+                    -- call onChanged safely on change
+                    task.spawn(onChanged)
+                end
+                prevState = curr
+            end
+        end
+    end)
+
+    -- attach to current adornee immediately
+    attachToCurrentAdornee()
+
+    -- initial kick
     task.spawn(onChanged)
 end
 
