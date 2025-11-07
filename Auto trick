@@ -1,14 +1,13 @@
+local input = loadstring(game:HttpGet('https://pastebin.com/raw/dYzQv3d8'))()
 
--- LocalScript (StarterPlayerScripts)
+
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local player = Players.LocalPlayer
 local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
--- loadstring(game:HttpGet("https://pastebin.com/raw/MzKS5uvm"))()
-
-
+local RemoteEvent = ReplicatedStorage.Modules.Network.RemoteEvent
+local UIS = game:GetService("UserInputService")
+local device = "Mobile"
 
 
 local function getBehaviorFolder()
@@ -18,66 +17,20 @@ local function getBehaviorFolder()
         :WaitForChild("Behavior")
 end
 
-local behaviorFolder = getBehaviorFolder()
-local monitored = {} -- tracks highlights we've attached to
-
-local function safeIsDescendantOf(inst, ancestor)
-    if not inst or not ancestor then return false end
-    local ok, res = pcall(function() return inst:IsDescendantOf(ancestor) end)
-    return ok and res
+local function getSprintingButton()
+    return player.PlayerGui:WaitForChild("MainUI"):WaitForChild("SprintingButton")
 end
 
+local behaviorFolder = getBehaviorFolder()
+local monitored = {}
+
 local function adorneeIsPlayerCharacter(h)
-    if not h or not h.Parent then return false end
-
-    -- safely grab adornee
-    local adornee = nil
-    pcall(function() adornee = h.Adornee end)
-    if not adornee then return false end
-
-    -- ensure we have a current character reference (don't block long; just return false if none)
+    if not h then return false end
+    local adornee = h.Adornee
     local char = player.Character
-    if not char then
-        -- if character not present yet, it's unlikely to be adornee now
-        -- but to reduce false-negative we can try to peek a little:
-        if player.CharacterAdded then
-            -- non-blocking quick check: if character added recently this will be handled by CharacterAdded connection elsewhere
-            return false
-        end
-        return false
-    end
-
-    -- direct equal
+    if not adornee or not char then return false end
     if adornee == char then return true end
-
-    -- if adornee is the model of the character (some cases) or a descendant of the character
-    if safeIsDescendantOf(adornee, char) then
-        return true
-    end
-
-    -- adornnee might be a Model that represents only a part of the character; check PrimaryPart / children
-    if adornee:IsA("Model") then
-        -- if the model contains any part that is descendant of char -> treat as match
-        local ok, found = pcall(function()
-            for _, part in ipairs(adornee:GetDescendants()) do
-                if part:IsA("BasePart") and part:IsDescendantOf(char) then
-                    return true
-                end
-            end
-            return false
-        end)
-        if ok and found then return true end
-    end
-
-    -- attachments: check the attachment's parent chain
-    if adornee:IsA("Attachment") then
-        local parentPart = adornee.Parent
-        if parentPart and safeIsDescendantOf(parentPart, char) then return true end
-    end
-
-    -- Humanoid-ish cases (if adornee is a Humanoid or similar object attached to character)
-    if adornee:IsA("Humanoid") and adornee.Parent == char then return true end
-
+    if adornee:IsDescendantOf(char) then return true end
     return false
 end
 
@@ -89,621 +42,71 @@ local function safeConnectPropertyChanged(instance, prop, fn)
     return nil
 end
 
--- CREATE JOYSTICK (but do NOT enable movement until shown)
+local lastJump = 0
+local cooldown = 0.3
 
-local ContextActionService = game:GetService("ContextActionService")
-
-local function createRobustJoystick()
-    local MOVE_SPEED = 16
-    local BASE_SIZE = 260               -- original base diameter (in pixels)
-    local KNOB_SIZE = 64                -- original knob size (in pixels)
-    local MARGIN = 20
-
-    local sizeMultiplier = 1            -- current multiplier (exposed via API)
-    local MAX_RADIUS = (BASE_SIZE - KNOB_SIZE) / 2
-
-    local humanoid = nil
-    local dragging = false
-    local trackedInput = nil
-    local moveDir = Vector3.new()
-
-    local screenGui = Instance.new("ScreenGui")
-    screenGui.Name = "RobustJoystickGui"
-    screenGui.ResetOnSpawn = false
-    screenGui.IgnoreGuiInset = true
-    screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-
-    local base = Instance.new("Frame")
-    base.Name = "JoystickBase"
-    base.Size = UDim2.new(0, BASE_SIZE * sizeMultiplier, 0, BASE_SIZE * sizeMultiplier)
-    base.AnchorPoint = Vector2.new(0, 1) -- bottom-left
-    base.Position = UDim2.new(0, MARGIN, 1, -MARGIN)
-    base.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-    base.BackgroundTransparency = 0.55
-    base.BorderSizePixel = 0
-    base.Parent = screenGui
-    base.ZIndex = 2
-
-    local knob = Instance.new("Frame")
-    knob.Name = "Knob"
-    knob.Size = UDim2.new(0, KNOB_SIZE * sizeMultiplier, 0, KNOB_SIZE * sizeMultiplier)
-    knob.AnchorPoint = Vector2.new(0, 0)
-    knob.BackgroundColor3 = Color3.fromRGB(220, 220, 220)
-    knob.BackgroundTransparency = 0.15
-    knob.BorderSizePixel = 0
-    knob.Parent = base
-    knob.ZIndex = 3
-
-    local function ensureSizes()
-        if not base or not knob then return end
-        if base.AbsoluteSize.Magnitude == 0 or knob.AbsoluteSize.Magnitude == 0 then
-            for i = 1, 6 do RunService.Heartbeat:Wait() end
-        end
-    end
-
-    local function recalcMaxRadius()
-        ensureSizes()
-        local bsize = base.AbsoluteSize.X
-        local ksize = knob.AbsoluteSize.X
-        MAX_RADIUS = math.max(1, (bsize - ksize) / 2)
-    end
-
-    local function centerKnobInstant()
-        ensureSizes()
-        if not base or not knob then return end
-        local bsize = base.AbsoluteSize
-        local ksize = knob.AbsoluteSize
-        local left = (bsize.X * 0.5) - (ksize.X * 0.5)
-        local top  = (bsize.Y * 0.5) - (ksize.Y * 0.5)
-        knob.Position = UDim2.new(0, left, 0, top)
-    end
-
-    local function baseCenter()
-        local pos = base.AbsolutePosition
-        local size = base.AbsoluteSize
-        return Vector2.new(pos.X + size.X * 0.5, pos.Y + size.Y * 0.5)
-    end
-
-    local function updateMoveFromFinger(fingerPos)
-        ensureSizes()
-        recalcMaxRadius()
-        local center = baseCenter()
-        local delta = Vector2.new(fingerPos.X - center.X, fingerPos.Y - center.Y)
-        local clamped = delta
-        if clamped.Magnitude > MAX_RADIUS then
-            clamped = clamped.Unit * MAX_RADIUS
-        end
-
-        local bsize = base.AbsoluteSize
-        local ksize = knob.AbsoluteSize
-        local left = (bsize.X * 0.5) + clamped.X - (ksize.X * 0.5)
-        local top  = (bsize.Y * 0.5) + clamped.Y - (ksize.Y * 0.5)
-        knob.Position = UDim2.new(0, left, 0, top)
-
-        local x = math.clamp(clamped.X / MAX_RADIUS, -1, 1)
-        local inputY = math.clamp(clamped.Y / MAX_RADIUS, -1, 1)
-        local z = inputY -- drag up -> forward
-
-        moveDir = Vector3.new(x, 0, z)
-    end
-
-    local function resetKnob()
-        moveDir = Vector3.new()
-        ensureSizes()
-        local bsize = base.AbsoluteSize
-        local ksize = knob.AbsoluteSize
-        local target = UDim2.new(0, (bsize.X*0.5) - (ksize.X*0.5), 0, (bsize.Y*0.5) - (ksize.Y*0.5))
-        pcall(function()
-            local tween = TweenService:Create(knob, TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Position = target})
-            tween:Play()
-        end)
-    end
-
-    local BLOCK_ACTION_NAME = "RobustJoystick_BlockCameraTouch"
-    local function blockTouchAction(actionName, inputState, inputObject)
-        if not trackedInput then
-            return Enum.ContextActionResult.Pass
-        end
-        if inputObject == trackedInput then
-            return Enum.ContextActionResult.Sink
-        end
-        return Enum.ContextActionResult.Pass
-    end
-
-    base.InputBegan:Connect(function(input)
-        if input.UserInputType ~= Enum.UserInputType.Touch then return end
-        dragging = true
-        trackedInput = input
-        ContextActionService:BindAction(BLOCK_ACTION_NAME, blockTouchAction, false, Enum.UserInputType.Touch)
-        updateMoveFromFinger(Vector2.new(input.Position.X, input.Position.Y))
-    end)
-
-    base.InputChanged:Connect(function(input)
-        if not dragging then return end
-        if input.UserInputType ~= Enum.UserInputType.Touch then return end
-        if input ~= trackedInput then return end
-        updateMoveFromFinger(Vector2.new(input.Position.X, input.Position.Y))
-    end)
-
-    base.InputEnded:Connect(function(input)
-        if input.UserInputType ~= Enum.UserInputType.Touch then return end
-        if input ~= trackedInput then return end
-        dragging = false
-        trackedInput = nil
-        ContextActionService:UnbindAction(BLOCK_ACTION_NAME)
-        resetKnob()
-    end)
-
-    local function bindCharacter(char)
-        humanoid = nil
-        if char then
-            humanoid = char:FindFirstChild("Humanoid") or char:WaitForChild("Humanoid")
-        end
-    end
-    if player.Character then bindCharacter(player.Character) end
-    player.CharacterAdded:Connect(bindCharacter)
-
-    local renderConn = nil
-    local function enableMovement()
-        if renderConn and renderConn.Connected then return end
-        renderConn = RunService.RenderStepped:Connect(function()
-            if humanoid and humanoid.Health > 0 then
-                humanoid:Move(moveDir * MOVE_SPEED, true)
-            end
-        end)
-    end
-
-    local function disableMovement()
-        if renderConn and renderConn.Connected then
-            renderConn:Disconnect()
-            renderConn = nil
-        end
-        moveDir = Vector3.new()
-        pcall(resetKnob)
-        pcall(function() ContextActionService:UnbindAction(BLOCK_ACTION_NAME) end)
-    end
-
-    -- API
-    local api = {
-        screenGui = screenGui,
-        centerKnobInstant = centerKnobInstant,
-        enableMovement = enableMovement,
-        disableMovement = disableMovement,
-        destroy = function()
-            disableMovement()
-            if screenGui and screenGui.Parent then screenGui.Parent = nil end
-            pcall(function() screenGui:Destroy() end)
-        end,
-    }
-
-    -- function to change multiplier at runtime
-    function api.setSizeMultiplier(mult)
-        if not mult or type(mult) ~= "number" then return end
-        sizeMultiplier = math.clamp(mult, 0.4, 2) -- clamp between 0.4x and 2x (tweak as desired)
-        -- update sizes
-        pcall(function()
-            base.Size = UDim2.new(0, math.floor(BASE_SIZE * sizeMultiplier + 0.5), 0, math.floor(BASE_SIZE * sizeMultiplier + 0.5))
-            knob.Size = UDim2.new(0, math.floor(KNOB_SIZE * sizeMultiplier + 0.5), 0, math.floor(KNOB_SIZE * sizeMultiplier + 0.5))
-            task.delay(0.03, function()
-                recalcMaxRadius()
-                pcall(centerKnobInstant)
-            end)
-        end)
-    end
-
-    -- ensure initial layout metrics computed after a short delay
-    task.delay(0.05, function()
-        recalcMaxRadius()
-        pcall(centerKnobInstant)
-    end)
-
-    return api
-end
-
--- create joystick API once (kept offscreen by default)
-local joystickAPI = createRobustJoystick()
-
--- SLIDER UI (top-left) -> call this after `local joystickAPI = createRobustJoystick()`
-local function createJoystickSizeSlider()
-    local MIN = 0.5
-    local MAX = 2.0
-    local DEFAULT = 1.0
-
-    local sgui = Instance.new("ScreenGui")
-    sgui.Name = "JoystickSizeSliderGui"
-    sgui.ResetOnSpawn = false
-    sgui.IgnoreGuiInset = true
-    sgui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    sgui.Parent = player:WaitForChild("PlayerGui")
-
-    local container = Instance.new("Frame")
-    container.Name = "SliderContainer"
-    container.Size = UDim2.new(0, 220, 0, 44)
-    container.Position = UDim2.new(0, 10, 0, 10) -- top-left
-    container.AnchorPoint = Vector2.new(0, 0)
-    container.BackgroundTransparency = 1
-    container.Parent = sgui
-
-    local label = Instance.new("TextLabel")
-    label.Name = "Label"
-    label.Size = UDim2.new(0, 120, 1, 0)
-    label.Position = UDim2.new(0, 0, 0, 0)
-    label.BackgroundTransparency = 1
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.TextYAlignment = Enum.TextYAlignment.Center
-    label.Font = Enum.Font.SourceSans
-    label.Text = ("Joystick x%.2f"):format(DEFAULT)
-    label.TextSize = 18
-    label.TextColor3 = Color3.fromRGB(255,255,255)
-    label.Parent = container
-
-    local track = Instance.new("Frame")
-    track.Name = "Track"
-    track.Size = UDim2.new(0, 160, 0, 12)
-    track.Position = UDim2.new(0, 120, 0.5, -6)
-    track.AnchorPoint = Vector2.new(0, 0.5)
-    track.BackgroundColor3 = Color3.fromRGB(100,100,100)
-    track.BackgroundTransparency = 0.4
-    track.BorderSizePixel = 0
-    track.Parent = container
-
-    local knob = Instance.new("Frame")
-    knob.Name = "Handle"
-    knob.Size = UDim2.new(0, 20, 0, 28)
-    knob.AnchorPoint = Vector2.new(0.5, 0.5)
-    knob.Position = UDim2.new(0, 0, 0.5, 0)
-    knob.BackgroundColor3 = Color3.fromRGB(230,230,230)
-    knob.BackgroundTransparency = 0.15
-    knob.BorderSizePixel = 0
-    knob.Parent = track
-
-    -- helper: set handle position by percent (0..1)
-    local function setPercent(p)
-        p = math.clamp(p, 0, 1)
-        local trackW = track.AbsoluteSize.X
-        if trackW <= 0 then
-            task.wait(0.03)
-            trackW = track.AbsoluteSize.X
-        end
-        knob.Position = UDim2.new(0, math.floor(p * trackW + 0.5), 0.5, 0)
-        local val = MIN + p * (MAX - MIN)
-        label.Text = ("Joystick x%.2f"):format(val)
-        pcall(function() joystickAPI.setSizeMultiplier(val) end)
-    end
-
-    -- compute initial position
-    task.delay(0.03, function()
-        local initialP = (DEFAULT - MIN) / (MAX - MIN)
-        setPercent(initialP)
-    end)
-
-    -- dragging logic for mouse & touch
-    local draggingHandle = false
-    local function updateFromInput(input)
-        local absPos = track.AbsolutePosition
-        local absSize = track.AbsoluteSize
-        local x = input.Position.X - absPos.X
-        local p = x / math.max(1, absSize.X)
-        setPercent(p)
-    end
-
-    knob.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            draggingHandle = true
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    draggingHandle = false
-                end
-            end)
-        end
-    end)
-
-    track.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            updateFromInput(input)
-            draggingHandle = true
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    draggingHandle = false
-                end
-            end)
-        end
-    end)
-
-    game:GetService("UserInputService").InputChanged:Connect(function(input)
-        if not draggingHandle then return end
-        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-            pcall(updateFromInput, input)
-        end
-    end)
-
-    return {
-        gui = sgui,
-        setValue = function(v) setPercent((v - MIN) / (MAX - MIN)) end
-    }
-end
-
--- create the slider
-local slider = createJoystickSizeSlider()
--- optional: expose slider to other code, or set a different default:
--- slider.setValue(1.2)
-
--- Add this block right after: local joystickAPI = createRobustJoystick()
-local highlightCount = 0
-local playingTargetAnim = false
-local TARGET_ANIM_ID = 117058860640843
-
-local function showJoystick()
-    if playingTargetAnim then return end
-    if not joystickAPI or not joystickAPI.screenGui then return end
-    if not joystickAPI.screenGui.Parent then
-        joystickAPI.screenGui.Parent = player:WaitForChild("PlayerGui")
-        task.delay(0.05, function() pcall(function() joystickAPI.centerKnobInstant() end) end)
-    end
-    pcall(function() joystickAPI.enableMovement() end)
-end
-
-local function hideJoystick()
-    if joystickAPI and joystickAPI.screenGui and joystickAPI.screenGui.Parent then
-        pcall(function() joystickAPI.disableMovement() end)
-        joystickAPI.screenGui.Parent = nil
-    else
-        pcall(function() joystickAPI.disableMovement() end)
-    end
-end
-
--- Animation / character watcher: hide joystick when the target anim plays, re-show when it stops (if no highlights)
-local function setupAnimationListener(character)
-    if not character then return end
-    local humanoid = character:FindFirstChild("Humanoid")
-    if not humanoid then return end
-
-    -- helper to inspect an AnimationTrack for our target id
-    local function checkTrack(track)
-        local ok, anim = pcall(function() return track.Animation end)
-        if not ok or not anim then return end
-        local id = tonumber(tostring(anim):match("%d+"))
-        if id == TARGET_ANIM_ID then
-            playingTargetAnim = true
-            hideJoystick()
-            -- when track stops, possibly re-show joystick (if no highlights)
-            task.spawn(function()
-                track.Stopped:Wait()
-                playingTargetAnim = false
-                if highlightCount == 0 then showJoystick() end
-            end)
-        end
-    end
-
-    -- catch future plays
-    local animator = humanoid:FindFirstChildWhichIsA("Animator") or humanoid:FindFirstChild("Animator")
-    if animator then
-        animator.AnimationPlayed:Connect(function(track) checkTrack(track) end)
-    else
-        -- sometimes Animator is added later
-        humanoid.ChildAdded:Connect(function(child)
-            if child:IsA("Animator") then
-                child.AnimationPlayed:Connect(function(track) checkTrack(track) end)
-            end
-        end)
-    end
-
-    -- check already-playing tracks
-    for _, t in ipairs(humanoid:GetPlayingAnimationTracks()) do
-        checkTrack(t)
-    end
-end
-
--- hook up for current character and future spawns
-if player.Character then setupAnimationListener(player.Character) end
-player.CharacterAdded:Connect(setupAnimationListener)
-
-
--- show joystick for <seconds>: parent it, enable movement; after seconds disable/unparent
-local showingTimer = nil
-local function showJoystickForSeconds(seconds)
-    if not joystickAPI or not joystickAPI.screenGui then return end
-
-    -- If it's already parented, reset timer (we want it visible for `seconds` from now).
-    if not joystickAPI.screenGui.Parent then
-        joystickAPI.screenGui.Parent = player:WaitForChild("PlayerGui")
-        -- center after parenting
-        task.delay(0.05, function()
-            if joystickAPI and joystickAPI.centerKnobInstant then
-                pcall(joystickAPI.centerKnobInstant)
-            end
-        end)
-    end
-
-    -- Enable the joystick's movement logic so it overrides the default.
-    pcall(function() joystickAPI.enableMovement() end)
-
-    -- If an earlier timer exists, cancel it by just letting a new one control the hiding.
-    if showingTimer then showingTimer:Cancel() end
-
-    -- We implement our own cancelable timer using a BindableEvent + task.spawn
-    local cancelled = false
-    showingTimer = {
-        Cancel = function() cancelled = true end
-    }
-
-    task.spawn(function()
-        local start = tick()
-        while tick() - start < seconds do
-            if cancelled then
-                return
-            end
-            task.wait(0.1)
-        end
-        -- time's up: hide and disable movement
-        pcall(function()
-            joystickAPI.disableMovement()
-            if joystickAPI.screenGui and joystickAPI.screenGui.Parent then
-                joystickAPI.screenGui.Parent = nil
-            end
-        end)
-    end)
-end
-
--- MONITOR HIGHLIGHTS and show joystick when highlight DESTROYED while adorning the player
 local function monitorHighlight(h)
     if not h or monitored[h] then return end
     monitored[h] = true
 
     local prevState = adorneeIsPlayerCharacter(h)
     local connections = {}
-    local adorneeConn = nil
-    local pollLoop = nil
-    local alive = true
 
     local function cleanup()
-        alive = false
         for _, conn in ipairs(connections) do
             if conn and conn.Connected then
                 conn:Disconnect()
             end
         end
-        if adorneeConn and adorneeConn.Connected then
-            adorneeConn:Disconnect()
-            adorneeConn = nil
-        end
-        if pollLoop then
-            pollLoop:Cancel()
-            pollLoop = nil
-        end
         monitored[h] = nil
     end
 
-    local function attachToCurrentAdornee()
-        -- disconnect old adornee listener
-        if adorneeConn and adorneeConn.Connected then
-            adorneeConn:Disconnect()
-            adorneeConn = nil
+    local function onChanged()
+        if not h or not h.Parent then
+            cleanup()
+            return
         end
 
-        local currentAdornee = nil
-        pcall(function() currentAdornee = h.Adornee end)
-        if currentAdornee and currentAdornee:IsA("Instance") then
-            -- listen to its AncestryChanged so we detect being parented under player char
-            local ok, conn = pcall(function()
-                return currentAdornee.AncestryChanged:Connect(function()
-                    if alive then
-                        task.spawn(function() -- small debounce
-                            onChanged()
-                        end)
-                    end
-                end)
-            end)
-            if ok and conn then adorneeConn = conn end
-        end
-    end
-
-    function onChanged()
-        if not h or not h.Parent then return end
         local currState = adorneeIsPlayerCharacter(h)
         if prevState ~= currState then
             if currState then
-                print("Highlight's Adornee is PLAYER ->", h:GetFullName())
-                -- your existing actions
-                pcall(function()
-                    keypress(Enum.KeyCode.Space)
-                    wait(0.09)
-                    keyrelease(Enum.KeyCode.Space)
-                end)
-            else
-                print("Highlight's Adornee is NOT player ->", h:GetFullName())
+                if device == "Mobile" then
+                    local btn = getSprintingButton()
+                    for i, v in pairs(getconnections(btn.MouseButton1Down)) do
+                        pcall(function() v:Fire() end)
+                        v:Function()
+                    end
+                end
             end
-            prevState = currState
         end
+        prevState = currState
     end
 
-    -- Connect safe Adornee property changes
-    local propConn = safeConnectPropertyChanged(h, "Adornee", function()
-        attachToCurrentAdornee()
-        onChanged()
-    end)
-    if propConn then table.insert(connections, propConn) end
+    local c = safeConnectPropertyChanged(h, "Adornee", onChanged)
+    if c then table.insert(connections, c) end
 
-    -- Respond when highlight is removed/destroyed
-    local ancestryConn = h.AncestryChanged:Connect(function(_, parent)
+    table.insert(connections, h.AncestryChanged:Connect(function(_, parent)
         if not parent then
-            -- highlight destroyed/removed
-            highlightCount = math.max(0, highlightCount - 1)
-            if highlightCount == 0 and not playingTargetAnim then
-                showJoystick()
-            end
             cleanup()
         else
             onChanged()
         end
-    end)
-    table.insert(connections, ancestryConn)
+    end))
 
-    -- Listen for player character changes too
     table.insert(connections, player.CharacterAdded:Connect(onChanged))
     table.insert(connections, player.CharacterRemoving:Connect(onChanged))
 
-    -- Start a short polling fallback to catch transient states (lightweight)
-    -- We use task.spawn + a cancelable token-like table
-    local cancelled = false
-    pollLoop = {
-        Cancel = function() cancelled = true end
-    }
-    task.spawn(function()
-        local lastCheck = tick()
-        while not cancelled and h and h.Parent do
-            -- check every 0.15s but only do a real check every 0.15s to avoid too much cost
-            task.wait(0.15)
-            if cancelled then break end
-            -- quick check
-            local ok, curr = pcall(function() return adorneeIsPlayerCharacter(h) end)
-            if ok then
-                if curr ~= prevState then
-                    -- call onChanged safely on change
-                    task.spawn(onChanged)
-                end
-                prevState = curr
-            end
-        end
-    end)
-
-    -- attach to current adornee immediately
-    attachToCurrentAdornee()
-
-    -- initial kick
     task.spawn(onChanged)
 end
 
--- replacement: maintain a global highlightCount and scan existing highlights
-highlightCount = 0
 for _, desc in ipairs(behaviorFolder:GetDescendants()) do
     if desc:IsA("Highlight") then
-        highlightCount = highlightCount + 1
         monitorHighlight(desc)
     end
 end
 
--- after initial scan: if no highlights and not playing the target anim, show joystick
-if highlightCount == 0 and not playingTargetAnim then
-    showJoystick()
-else
-    hideJoystick()
-end
-
--- when new highlights are added, increment and hide joystick
 behaviorFolder.DescendantAdded:Connect(function(child)
     if child:IsA("Highlight") then
-        if not monitored[child] then
-            highlightCount = highlightCount + 1
-            hideJoystick()
-            monitorHighlight(child)
-            print("Highlight added ->", child:GetFullName())
-        end
+        monitorHighlight(child)
     end
 end)
-
--- Ensure joystick is disabled by default (so Roblox's normal joystick controls movement initially)
-pcall(function() joystickAPI.disableMovement() end)
-
-
--- REPLACE the old createRobustJoystick() with this version
